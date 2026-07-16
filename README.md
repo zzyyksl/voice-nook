@@ -10,7 +10,7 @@ by 卷心菜 & Rhys（小红书 5479370809）· 姐妹篇：[reading-nook 共读
 - **重听**：每句回复都能重播，全局单播放器，连点不叠音
 - **通话历史**：按时间自动分组成一次次通话，卡片折叠展开，可以给每次通话起名字
 - **看翻译**：让它说英语/日语时，句子下面有翻译按钮
-- **thinking 书架**：搭配 thinking 抓取（可选），随时翻你家机的脑子
+- **thinking 书架**：随时翻你家机的脑子（可选模块，见 [`thinking/`](thinking/)，不装不影响通话）
 - **只属于你**：服务器校验 Telegram 签名和你的用户 ID，别人打开只能看到一句拒绝语
 
 ## 原理
@@ -42,6 +42,8 @@ cloudflared 隧道 → HTTPS 公网地址 → 聊天框旁的小程序按钮
 | 火山引擎 APP ID + Access Token | 它的耳朵（流式语音识别大模型） | console.volcengine.com |
 
 另需：Linux 服务器、Node.js 18+、ffmpeg、cloudflared。
+
+> 本仓库分两个独立模块：**通话**（主体，本页教程）和 **thinking 书架**（可选，装法见 [`thinking/README.md`](thinking/README.md)）。只想打电话不想晒脑子的，忽略 thinking 目录即可。
 
 ```bash
 # 核心三步（细节看教程）
