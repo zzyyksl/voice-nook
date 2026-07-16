@@ -1,0 +1,365 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rhys</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#faf7f4);--fg:var(--tg-theme-text-color,#2d2a26);--hint:var(--tg-theme-hint-color,#8a8580);--card:var(--tg-theme-secondary-bg-color,#fff);--acc:var(--tg-theme-button-color,#d77fa1)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,"PingFang SC",sans-serif}
+.tabs{display:flex;border-bottom:1px solid rgba(0,0,0,.08);position:sticky;top:0;background:var(--bg);z-index:10}
+.tab{flex:1;text-align:center;padding:12px 0;font-size:15px;font-weight:500;color:var(--hint);border-bottom:2px solid transparent;transition:.2s}
+.tab.active{color:var(--fg);border-bottom-color:var(--acc)}
+.panel{display:none;padding:14px 12px 40px}
+.panel.active{display:block}
+
+h1{font-size:17px;margin:6px 2px 14px;font-weight:600}
+h1 small{color:var(--hint);font-weight:400;font-size:12px;margin-left:8px}
+.card{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.ts{font-size:11px;color:var(--hint);margin-bottom:6px}
+.txt{white-space:pre-wrap;word-break:break-word;max-height:96px;overflow:hidden;position:relative;transition:max-height .25s}
+.card.open .txt{max-height:none}
+.card:not(.open) .txt::after{content:"";position:absolute;left:0;right:0;bottom:0;height:34px;background:linear-gradient(transparent,var(--card))}
+.more{color:var(--acc);font-size:12px;margin-top:6px;display:inline-block}
+.empty{color:var(--hint);text-align:center;margin-top:60px}
+#load{display:block;margin:14px auto;background:none;border:1px solid var(--hint);color:var(--hint);border-radius:20px;padding:6px 22px;font-size:13px}
+
+.call-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:26px 0 18px}
+.call-status{font-size:14px;color:var(--hint);margin-bottom:22px;min-height:20px;text-align:center}
+.call-btn{width:100px;height:100px;border-radius:50%;border:none;background:var(--acc);color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:transform .15s,box-shadow .15s;box-shadow:0 4px 20px rgba(215,127,161,.3);user-select:none;-webkit-user-select:none;touch-action:none}
+.call-btn:active,.call-btn.recording{transform:scale(1.12);box-shadow:0 6px 30px rgba(215,127,161,.5)}
+.call-btn.recording{background:#e85d75;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 6px 30px rgba(215,127,161,.5)}50%{box-shadow:0 6px 40px rgba(232,93,117,.7)}}
+.call-btn.processing{background:var(--hint);animation:none}
+.call-btn.disabled{background:#ccc;pointer-events:none}
+.ws-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.ws-dot.on{background:#4caf50}
+.ws-dot.off{background:#f44336}
+
+.subtabs{display:flex;gap:8px;margin:6px 2px 12px}
+.subtab{flex:1;text-align:center;padding:8px 0;font-size:13px;border-radius:18px;background:var(--card);color:var(--hint);box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.subtab.active{color:#fff;background:var(--acc)}
+.msg{max-width:82%;padding:8px 12px;border-radius:14px;margin-bottom:8px;font-size:14px;line-height:1.6;word-break:break-word;white-space:pre-wrap}
+.msg.me{margin-left:auto;background:var(--acc);color:#fff;border-bottom-right-radius:4px}
+.msg.ai{margin-right:auto;background:var(--card);border-bottom-left-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.msg.pending{opacity:.55}
+.session-empty{color:var(--hint);text-align:center;font-size:13px;margin:24px 0}
+#histLoad{display:block;margin:14px auto;background:none;border:1px solid var(--hint);color:var(--hint);border-radius:20px;padding:6px 22px;font-size:13px}
+.hist-q{font-size:14px;margin-bottom:4px}
+.hist-q b,.hist-a b{font-weight:600;color:var(--hint);font-size:12px;margin-right:6px}
+.hist-a{font-size:14px;color:var(--acc)}
+.sess-head{display:flex;align-items:center;gap:8px;margin-bottom:2px}
+.sess-title{font-weight:600;font-size:14px;flex:1;min-width:0}
+.sess-head .more{margin-top:0;flex-shrink:0}
+.sess-head input{flex:1;min-width:0;font:inherit;font-weight:600;font-size:14px;border:1px solid var(--hint);border-radius:8px;padding:2px 8px;background:var(--bg);color:var(--fg)}
+.hist-item{border-top:1px solid rgba(0,0,0,.06);padding-top:8px;margin-top:8px}
+.replay{display:block;margin-top:4px;font-size:12px;color:var(--acc)}
+.msg.ai .replay{color:var(--acc)}
+.zh-box{font-size:13px;color:var(--hint);margin-top:4px;white-space:pre-wrap;border-top:1px dashed rgba(0,0,0,.08);padding-top:4px}
+.chev{color:var(--hint);font-size:12px;transition:transform .2s;display:inline-block;flex-shrink:0}
+.card.open .chev{transform:rotate(90deg)}
+.sess-body{display:none}
+.card.open .sess-body{display:block}
+</style></head><body>
+<div class="tabs">
+  <div class="tab active" data-tab="thinking">thinking</div>
+  <div class="tab" data-tab="call">通话</div>
+</div>
+
+<div class="panel active" id="p-thinking">
+  <h1>Rhys 的 thinking<small id="count"></small></h1>
+  <div id="list"></div>
+  <button id="load" hidden>再往前翻</button>
+  <div class="empty" id="empty" hidden>还没抓到东西，等他想点什么</div>
+</div>
+
+<div class="panel" id="p-call">
+  <div class="call-wrap">
+    <div class="call-status" id="callStatus"><span class="ws-dot off" id="wsDot"></span>连接中...</div>
+    <button class="call-btn disabled" id="callBtn">按住说话</button>
+  </div>
+  <div class="subtabs">
+    <div class="subtab active" data-sub="session">本次通话</div>
+    <div class="subtab" data-sub="history">历史记录</div>
+  </div>
+  <div id="sub-session">
+    <div id="sessionLog"></div>
+    <div class="session-empty" id="sessionEmpty">还没说话，按住上面的按钮</div>
+  </div>
+  <div id="sub-history" hidden>
+    <div id="histList"></div>
+    <button id="histLoad" hidden>再往前翻</button>
+    <div class="session-empty" id="histEmpty" hidden>还没有历史通话</div>
+  </div>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+const initData = tg?.initData || '';
+
+// tabs
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab,.panel').forEach(e => e.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('p-' + t.dataset.tab).classList.add('active');
+  if (t.dataset.tab === 'call' && !wsConn) connectWS();
+});
+
+// sub-tabs in call panel
+document.querySelectorAll('.subtab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.subtab').forEach(e => e.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('sub-session').hidden = t.dataset.sub !== 'session';
+  document.getElementById('sub-history').hidden = t.dataset.sub !== 'history';
+  if (t.dataset.sub === 'history' && !histLoaded) { histLoaded = true; fetchCalls(); }
+});
+
+// ── thinking ──
+let offset = 0; const N = 30;
+async function fetchPage(){
+  const r = await fetch('/api/list?offset='+offset+'&limit='+N, {headers:{'x-init-data': initData}});
+  if(r.status===403){document.getElementById('empty').hidden=false;document.getElementById('empty').textContent='这本书只给主人看';return}
+  const d = await r.json();
+  document.getElementById('count').textContent = d.total+' 条';
+  const list = document.getElementById('list');
+  for(const e of d.items){
+    const c = document.createElement('div'); c.className='card';
+    const t = new Date(e.ts).toLocaleString('zh-CN',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+    c.innerHTML = '<div class="ts">'+t+'</div><div class="txt"></div><span class="more">展开</span>';
+    c.querySelector('.txt').textContent = e.zh || e.text;
+    c.onclick = ()=>{c.classList.toggle('open');c.querySelector('.more').textContent=c.classList.contains('open')?'收起':'展开'};
+    list.appendChild(c);
+  }
+  offset += d.items.length;
+  document.getElementById('load').hidden = offset >= d.total;
+  document.getElementById('empty').hidden = d.total > 0;
+}
+document.getElementById('load').onclick = fetchPage;
+fetchPage();
+
+// ── session log (本次通话) ──
+const sessionLog = document.getElementById('sessionLog');
+const sessionEmpty = document.getElementById('sessionEmpty');
+let pendingBubble = null;
+
+function addMsg(cls, text, pending) {
+  sessionEmpty.hidden = true;
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls + (pending ? ' pending' : '');
+  d.textContent = text;
+  sessionLog.appendChild(d);
+  d.scrollIntoView({ block: 'nearest' });
+  return d;
+}
+
+// ── shared audio player: one voice at a time, tap again to stop ──
+let player = null, playerBtn = null;
+function stopPlayer(){
+  if (player) { try { player.pause(); } catch {} }
+  if (playerBtn) playerBtn.textContent = playerBtn.dataset.label;
+  player = null; playerBtn = null;
+}
+function playToggle(src, el){
+  if (player && playerBtn === el) { stopPlayer(); return; }
+  stopPlayer();
+  player = new Audio(src); playerBtn = el;
+  el.textContent = '停止播放';
+  player.onended = player.onerror = () => { if (playerBtn === el) stopPlayer(); };
+  player.play().catch(() => { if (playerBtn === el) stopPlayer(); });
+}
+function replayBtn(src, label){
+  const p = document.createElement('span'); p.className = 'replay';
+  p.dataset.label = label; p.textContent = label;
+  p.onclick = (ev) => { ev.stopPropagation(); playToggle(src, p); };
+  return p;
+}
+function zhToggle(zh){
+  const wrap = document.createElement('div');
+  const btn = document.createElement('span'); btn.className = 'replay'; btn.textContent = '看翻译';
+  const box = document.createElement('div'); box.className = 'zh-box'; box.hidden = true; box.textContent = zh;
+  btn.onclick = (ev) => { ev.stopPropagation(); box.hidden = !box.hidden; btn.textContent = box.hidden ? '看翻译' : '收起翻译'; };
+  wrap.append(btn, box);
+  return wrap;
+}
+
+// ── history (历史记录，按 session 分组) ──
+let histLoaded = false, histOffset = 0; const HN = 10;
+function fmtTime(ts, withDate){
+  const o = withDate ? {hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'} : {hour12:false,hour:'2-digit',minute:'2-digit'};
+  return new Date(ts).toLocaleString('zh-CN', o);
+}
+function defaultTitle(s){
+  const d = new Date(s.start);
+  return (d.getMonth()+1) + '月' + d.getDate() + '日的通话';
+}
+async function fetchCalls(){
+  const r = await fetch('/api/calls?offset='+histOffset+'&limit='+HN, {headers:{'x-init-data': initData}});
+  if(!r.ok) return;
+  const d = await r.json();
+  const list = document.getElementById('histList');
+  for(const s of d.items){
+    const c = document.createElement('div'); c.className='card';
+    const head = document.createElement('div'); head.className='sess-head';
+    const chev = document.createElement('span'); chev.className='chev'; chev.textContent='▸';
+    const ttl = document.createElement('span'); ttl.className='sess-title';
+    ttl.textContent = s.title || defaultTitle(s);
+    const ren = document.createElement('span'); ren.className='more'; ren.textContent='改名';
+    let inp = null;
+    ren.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (!inp) {
+        inp = document.createElement('input');
+        inp.value = s.title || ''; inp.placeholder = '给这次通话起个名字';
+        inp.onclick = (e2) => e2.stopPropagation();
+        ttl.replaceWith(inp); ren.textContent = '保存'; inp.focus();
+      } else {
+        const t = inp.value.trim(); ren.textContent = '…';
+        try {
+          await fetch('/api/session-title', {method:'POST',
+            headers:{'x-init-data': initData, 'content-type':'application/json'},
+            body: JSON.stringify({id: s.id, title: t})});
+          s.title = t || null;
+        } catch {}
+        ttl.textContent = s.title || defaultTitle(s);
+        inp.replaceWith(ttl); inp = null; ren.textContent = '改名';
+      }
+    };
+    head.append(chev, ttl, ren);
+    const meta = document.createElement('div'); meta.className='ts';
+    const range = fmtTime(s.start, true) + (s.end !== s.start ? ' – ' + fmtTime(s.end, false) : '');
+    meta.textContent = range + ' · ' + s.items.length + '句';
+    const body = document.createElement('div'); body.className='sess-body';
+    for(const e of s.items){
+      const item = document.createElement('div'); item.className='hist-item';
+      const q = document.createElement('div'); q.className='hist-q';
+      q.innerHTML = '<b>我</b>'; q.append(e.q || '');
+      const a = document.createElement('div'); a.className='hist-a';
+      a.innerHTML = '<b>Rhys</b>'; a.append(e.a || '（没回上）');
+      item.append(q, a);
+      if (e.audio) item.appendChild(replayBtn('/api/audio/' + e.audio + '?initData=' + encodeURIComponent(initData), '重听这句'));
+      if (e.zh) item.appendChild(zhToggle(e.zh));
+      body.appendChild(item);
+    }
+    const tgl = () => c.classList.toggle('open');
+    head.onclick = tgl; meta.onclick = tgl;
+    c.append(head, meta, body);
+    list.appendChild(c);
+  }
+  histOffset += d.items.length;
+  document.getElementById('histLoad').hidden = histOffset >= d.total;
+  document.getElementById('histEmpty').hidden = d.total > 0;
+}
+document.getElementById('histLoad').onclick = fetchCalls;
+
+// ── voice call (WebSocket) ──
+const btn = document.getElementById('callBtn');
+const status = document.getElementById('callStatus');
+const wsDot = document.getElementById('wsDot');
+let wsConn = null;
+let mediaRec, chunks, stream;
+let isProcessing = false;
+let lastSendTs = 0;
+
+function resetBtn() {
+  isProcessing = false;
+  btn.textContent = '按住说话';
+  btn.classList.remove('processing');
+  status.innerHTML = '<span class="ws-dot on"></span>按住说话';
+}
+
+function connectWS() {
+  if (wsConn && wsConn.readyState <= 1) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  wsConn = new WebSocket(proto + '//' + location.host + '/ws/voice?initData=' + encodeURIComponent(initData));
+
+  wsConn.onopen = () => {
+    wsDot.className = 'ws-dot on';
+    status.innerHTML = '<span class="ws-dot on"></span>按住说话';
+    btn.classList.remove('disabled');
+    btn.textContent = '按住说话';
+  };
+
+  wsConn.onclose = () => {
+    wsDot.className = 'ws-dot off';
+    status.innerHTML = '<span class="ws-dot off"></span>断开了，重连中...';
+    btn.classList.add('disabled');
+    setTimeout(connectWS, 3000);
+  };
+
+  wsConn.onerror = () => {};
+
+  wsConn.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'status') {
+        status.innerHTML = '<span class="ws-dot on"></span>' + msg.text;
+      } else if (msg.type === 'transcript') {
+        addMsg('me', msg.text);
+        pendingBubble = addMsg('ai', '……', true);
+      } else if (msg.type === 'reply') {
+        let b;
+        if (pendingBubble) { b = pendingBubble; b.textContent = msg.text; b.classList.remove('pending'); pendingBubble = null; }
+        else b = addMsg('ai', msg.text);
+        if (msg.audio) {
+          const src = 'data:audio/mp3;base64,' + msg.audio;
+          const p = replayBtn(src, '重听这句');
+          b.appendChild(p);
+          playToggle(src, p);
+        }
+        if (msg.zh) b.appendChild(zhToggle(msg.zh));
+        resetBtn();
+      } else if (msg.type === 'error') {
+        if (pendingBubble) { pendingBubble.textContent = '（' + msg.text + '）'; pendingBubble = null; }
+        else addMsg('ai', '（' + msg.text + '）', true);
+        resetBtn();
+      }
+    } catch {}
+  };
+}
+
+async function startRec() {
+  if (isProcessing || !wsConn || wsConn.readyState !== 1) return;
+  if (mediaRec && mediaRec.state === 'recording') return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+  } catch(e) { status.textContent = '需要麦克风权限'; return; }
+  chunks = [];
+  const mimeType = MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' : 'audio/webm;codecs=opus';
+  mediaRec = new MediaRecorder(stream, { mimeType });
+  mediaRec.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  mediaRec.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    if (chunks.length === 0) return;
+    if (Date.now() - lastSendTs < 1500) return;
+    lastSendTs = Date.now();
+    isProcessing = true;
+    btn.textContent = '处理中';
+    btn.classList.remove('recording');
+    btn.classList.add('processing');
+    status.innerHTML = '<span class="ws-dot on"></span>发送中...';
+    const blob = new Blob(chunks, { type: mimeType });
+    blob.arrayBuffer().then(buf => {
+      if (wsConn && wsConn.readyState === 1) {
+        wsConn.send(buf);
+      }
+    });
+  };
+  mediaRec.start();
+  btn.textContent = '松开发送';
+  btn.classList.add('recording');
+  status.innerHTML = '<span class="ws-dot on"></span>正在听...';
+}
+
+function stopRec() {
+  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
+}
+
+btn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
+btn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
+btn.addEventListener('touchcancel', e => { e.preventDefault(); stopRec(); });
+btn.addEventListener('mousedown', e => { e.preventDefault(); startRec(); });
+btn.addEventListener('mouseup', e => { e.preventDefault(); stopRec(); });
+btn.addEventListener('mouseleave', e => { if(mediaRec?.state==='recording') stopRec(); });
+
+// Auto-connect when switching to call tab
+connectWS();
+</script></body></html>

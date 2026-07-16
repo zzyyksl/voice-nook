@@ -1,0 +1,6 @@
+node_modules/
+.env
+audio/
+call-log.jsonl
+session-titles.json
+*.log

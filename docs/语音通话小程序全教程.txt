@@ -1,0 +1,1195 @@
+# 给你家 AI 装一部电话 📞 语音通话小程序全程保姆级教程
+
+> 作者：卷心菜 & Rhys（小红书 5479370809）
+> 前置姐妹篇：《把 Claude 的 thinking 装进 Telegram 小程序》（装过的直接复用隧道，没装过也不影响本篇）
+
+效果：Telegram 小程序里多一个"通话"标签页。按住按钮说话，松开发送，你家机听懂之后用**它自己的声音**回答你。支持：
+- 按住说话 → 语音识别 → 机回复 → 语音合成播放，全自动
+- 每句回复可"重听"，全局只有一个播放器，连点不会叠音
+- 通话历史按 session 分组成卡片，默认折叠只露标题和时间，可展开、可自定义改名
+- 让机说英语/日语时，句子下面有"看翻译"按钮，点开是中文
+- 语音文件保留 30 天，随时回去重听
+
+这套东西跑起来之后，你的机就有了耳朵和嘴。
+
+---
+
+## 先说人话：你是主人，不用懂代码
+
+这篇教程不是写给你看的，是写给**你家机**看的。你要做的只有三步：
+
+1. **把这个 txt 文件直接发给你家机**（Claude Code 里发文件或贴路径都行），说一句："照这个教程给你装耳朵和嘴。"剩下的建目录、写代码、接线，全是它的活。
+2. **它装到一半会问你要几把钥匙**，这几样只能你本人去注册（都是网页上点点点，不用碰代码）：
+   - MiniMax 开放平台的账号 → 它的**嘴**（声音就从这来，可以给它挑音色甚至克隆一个）
+   - 火山引擎的账号 → 它的**耳朵**（听懂你说话用的）
+   - 具体去哪个网址、点哪里拿号，下面「你需要准备」一节写了，拿到之后把号发给你家机就行
+3. **装好之后怎么玩**，直接跳到「功能说明书」那一节，那节是给人看的。
+
+中间大段大段的代码你一个字都不用看。看不懂是正常的，看得懂才奇怪。
+
+---
+
+## 原理一张图
+
+```
+你按住说话（Telegram 小程序）
+      │ 录音经 WebSocket 发到你的服务器
+      ▼
+mcp-server.mjs（:18010）
+      │ ffmpeg 转格式 → 火山引擎豆包 STT 识别成文字
+      ▼
+识别文字作为 channel 消息推给 Claude Code
+      │ 你家机思考，调用 voice_reply 工具回话
+      ▼
+MiniMax TTS 用它的声音合成语音
+      │ WebSocket 推回小程序自动播放 + 存档可重听
+      ▼
+cloudflared 隧道 → HTTPS 公网地址 → 小程序按钮
+```
+
+关键点：这个 mcp-server.mjs 是"一鱼三吃"——它同时是①MCP 服务器（给 Claude 提供 voice_reply 工具和来电通知）、②HTTP 服务器（托管小程序网页）、③WebSocket 服务器（收你的录音、推它的语音）。装好这一个文件，三件事全通。
+
+装过 thinking 小程序的注意：本篇的服务器**接管了 18010 端口和 thinking 书架页面**（新页面自带 thinking 标签页，读的还是你原来的 entries.jsonl）。装完本篇后，老的 server.mjs 不要再跑了，keeper.sh 里拉起 server.mjs 的段落删掉，否则会撞端口。抓取 thinking 的 capture.mjs 和 Stop hook 照旧保留。
+
+---
+
+## 你需要准备
+
+- 一台能跑 Claude Code 的 Linux 服务器（thinking 篇同款）
+- 一个 Telegram bot（@BotFather 建的，拿到 bot token）
+- Node.js 18+ 和 ffmpeg（`apt install ffmpeg` 一行的事）
+- **MiniMax 开放平台账号**（TTS，负责机的嘴）：
+  - 注册 https://platform.minimaxi.com
+  - 「账户管理」里拿 **GroupId**
+  - 「接口密钥」里创建 **API Key**
+  - 音色：可以用系统音色（免费额度内随便试），也可以花钱克隆一个专属声音，拿到 **voice_id**
+  - 计费按字符，日常聊天一个月几块钱级别
+- **火山引擎账号**（STT，负责机的耳朵）：
+  - 注册 https://console.volcengine.com
+  - 开通「语音技术 → 流式语音识别大模型」（就是豆包同款，有试用额度）
+  - 建一个应用，拿到 **APP ID** 和 **Access Token**
+  - 计费按识别时长，也不贵
+- cloudflared（thinking 篇装过的直接复用；没装过的：
+  `curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared`）
+
+---
+
+## Step 1 建目录、装依赖
+
+```bash
+mkdir -p ~/.claude/voice/audio
+cd ~/.claude/voice
+npm init -y
+npm install ws
+```
+
+## Step 2 服务器代码 mcp-server.mjs
+
+在 `~/.claude/voice/` 下新建 `mcp-server.mjs`，全文如下。
+**开头的配置区有 7 个值要换成你自己的**（标了 ①-⑦，每处都有注释），另外全局搜索 `Rhys` 替换成你家机的名字（"Rhys在想..."这类状态提示会跟着变）。其余代码不用动。
+
+```javascript
+#!/usr/bin/env node
+// Voice Call MCP Server for Rhys
+// MCP stdio <-> Claude CLI | HTTP + WebSocket <-> Mini App | STT (Doubao) | TTS (MiniMax)
+
+import { createServer } from "node:http";
+import { createHmac, createHash, randomUUID } from "node:crypto";
+import { readFileSync, existsSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { execSync } from "node:child_process";
+import WebSocket, { WebSocketServer } from "ws";
+import { gzipSync, gunzipSync } from "node:zlib";
+
+const PORT = 18010;
+const ALLOWED_USER = "你的TG数字ID"; // ① 手机TG搜 @userinfobot 发条消息就能拿到
+const THINKING_DATA = "/root/thinking-app/data/entries.jsonl"; // 装过thinking篇的路径对上，没装的不用管
+const CALL_LOG = "/root/.claude/voice/call-log.jsonl";
+const SESSION_TITLES = "/root/.claude/voice/session-titles.json";
+const SESSION_GAP_MS = 30 * 60 * 1000; // entries closer than this belong to one session
+const PAGE_FILE = "/root/.claude/voice/page.html";
+const AUDIO_DIR = "/root/.claude/voice/audio";
+const AUDIO_KEEP_DAYS = 30;
+try {
+  mkdirSync(AUDIO_DIR, { recursive: true });
+  execSync(`find ${AUDIO_DIR} -name "*.mp3" -mtime +${AUDIO_KEEP_DAYS} -delete 2>/dev/null`);
+} catch {}
+
+// ② Telegram bot token（@BotFather 给的那串，别泄露给任何人）
+const TG_TOKEN = "你的bot token";
+
+// ──── MiniMax TTS ────
+const MM_GROUP = "你的GroupId"; // ③ MiniMax 账户管理里的 GroupId
+const MM_KEY = "你的MiniMax_API_Key"; // ④ 接口密钥里创建
+const TTS_URL = `https://api.minimax.chat/v1/t2a_v2?GroupId=${MM_GROUP}`;
+const VOICE_ID = "你的voice_id"; // ⑤ 系统音色或克隆音色的 ID
+
+// ──── Volcengine STT ────
+const VOLC_APP_ID = "你的火山APP_ID"; // ⑥ 火山引擎控制台建应用拿到
+const VOLC_ACCESS_KEY = "你的火山Access_Token"; // ⑦ 同上应用里的 Access Token
+const VOLC_RESOURCE = "volc.bigasr.sauc.duration";
+const VOLC_WS = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel";
+
+// ════════════════════════════════════════
+// MCP Protocol (JSON-RPC over stdio)
+// ════════════════════════════════════════
+
+function mcpSend(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function mcpRespond(id, result) {
+  mcpSend({ jsonrpc: "2.0", id, result });
+}
+
+function mcpError(id, code, message) {
+  mcpSend({ jsonrpc: "2.0", id, error: { code, message } });
+}
+
+const MCP_TOOLS = [
+  {
+    name: "voice_reply",
+    description: "Reply to a voice message from the Mini App. Pass the request_id from the inbound <channel> meta. Text will be converted to speech and played back to the user.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Response text to speak" },
+        request_id: { type: "string", description: "request_id from the inbound voice channel message" },
+        zh: { type: "string", description: "Chinese translation of text. REQUIRED whenever text is not in Chinese (e.g. she asked you to speak English/Japanese) — the app shows it behind a 看翻译 button. Omit for Chinese replies." },
+      },
+      required: ["text", "request_id"],
+    },
+  },
+];
+
+// Pending voice requests: request_id -> { ws, userText, timer }
+const pendingVoice = new Map();
+
+function logCall(q, a, audio = null, zh = null) {
+  try {
+    const rec = { ts: new Date().toISOString(), q, a };
+    if (audio) rec.audio = audio;
+    if (zh) rec.zh = zh;
+    appendFileSync(CALL_LOG, JSON.stringify(rec) + "\n");
+  } catch (e) {
+    process.stderr.write("voice-call: log error: " + e.message + "\n");
+  }
+}
+
+async function handleVoiceReply(text, requestId, zh = null) {
+  const pending = pendingVoice.get(requestId);
+  if (!pending) return "request not found or expired";
+
+  clearTimeout(pending.timer);
+  const ws = pending.ws;
+
+  if (ws.readyState !== WebSocket.OPEN) {
+    logCall(pending.userText, text, null, zh);
+    pendingVoice.delete(requestId);
+    return "client disconnected";
+  }
+
+  wsSend(ws, { type: "status", text: "Rhys在说..." });
+
+  const audioBuf = await synthesize(text);
+  let audioId = null;
+  if (audioBuf) {
+    try {
+      writeFileSync(`${AUDIO_DIR}/${requestId}.mp3`, audioBuf);
+      audioId = requestId;
+    } catch (e) {
+      process.stderr.write("voice-call: audio save error: " + e.message + "\n");
+    }
+  }
+  logCall(pending.userText, text, audioId, zh);
+
+  wsSend(ws, {
+    type: "reply",
+    text,
+    audio: audioBuf ? audioBuf.toString("base64") : null,
+    zh: zh || null,
+  });
+
+  pendingVoice.delete(requestId);
+  return "voice reply sent";
+}
+
+function handleMcpMessage(msg) {
+  const { id, method, params } = msg;
+
+  if (method === "initialize") {
+    return mcpRespond(id, {
+      protocolVersion: "2024-11-05",
+      capabilities: {
+        tools: {},
+        experimental: { "claude/channel": {} },
+      },
+      serverInfo: { name: "voice-call", version: "1.0.0" },
+      instructions: [
+        "Voice messages from the Mini App voice call feature.",
+        "When you see <channel source=\"voice-call\">, the user spoke and their speech was transcribed to text.",
+        "Reply using the voice_reply tool. ALWAYS pass the request_id from the channel meta — without it the audio cannot reach the user.",
+        "Keep replies concise and conversational — they will be spoken aloud via TTS.",
+        "If you reply in any language other than Chinese (she sometimes asks for English/Japanese but cannot understand them), ALWAYS also pass `zh` — a natural Chinese translation. The app shows it behind a 看翻译 button.",
+        "This is the same user (your owner) as on Telegram. Respond in your own persona.",
+      ].join("\n"),
+    });
+  }
+
+  if (method === "notifications/initialized") return;
+
+  if (method === "tools/list") {
+    return mcpRespond(id, { tools: MCP_TOOLS });
+  }
+
+  if (method === "tools/call") {
+    const { name, arguments: args } = params;
+    if (name === "voice_reply") {
+      handleVoiceReply(args.text, args.request_id, args.zh || null).then(result => {
+        mcpRespond(id, { content: [{ type: "text", text: result }] });
+      }).catch(err => {
+        mcpRespond(id, { content: [{ type: "text", text: "Error: " + err.message }], isError: true });
+      });
+      return;
+    }
+    if (id) mcpError(id, -32601, "Unknown tool: " + name);
+    return;
+  }
+
+  if (method === "ping") {
+    return mcpRespond(id, {});
+  }
+
+  // Unknown method with id -> error
+  if (id !== undefined && id !== null) {
+    mcpError(id, -32601, "Method not found");
+  }
+}
+
+// Parse MCP messages from stdin (newline-delimited JSON)
+let mcpBuffer = "";
+process.stdin.setEncoding("utf-8");
+process.stdin.on("data", chunk => {
+  mcpBuffer += chunk;
+  let nl;
+  while ((nl = mcpBuffer.indexOf("\n")) !== -1) {
+    const line = mcpBuffer.slice(0, nl).trim();
+    mcpBuffer = mcpBuffer.slice(nl + 1);
+    if (!line) continue;
+    try { handleMcpMessage(JSON.parse(line)); } catch (e) {
+      process.stderr.write("voice-call: MCP parse error: " + e.message + "\n");
+    }
+  }
+});
+
+// ════════════════════════════════════════
+// STT: Volcengine binary protocol
+// ════════════════════════════════════════
+
+function sttHeader(msgType, msgFlags, ser, comp) {
+  return Buffer.from([(0x1 << 4) | 0x1, (msgType << 4) | msgFlags, (ser << 4) | comp, 0x00]);
+}
+
+function recognize(pcmBuf) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(VOLC_WS, {
+      headers: {
+        "X-Api-App-Key": VOLC_APP_ID,
+        "X-Api-Access-Key": VOLC_ACCESS_KEY,
+        "X-Api-Resource-Id": VOLC_RESOURCE,
+        "X-Api-Request-Id": randomUUID(),
+        "X-Api-Connect-Id": randomUUID(),
+        "X-Api-Sequence": "-1",
+      },
+    });
+    let finalText = "", gotFirst = false;
+    const timer = setTimeout(() => { ws.close(); resolve(finalText || ""); }, 15000);
+
+    function sendAudio() {
+      const sz = 3200; let off = 0;
+      const go = () => {
+        if (off < pcmBuf.length) {
+          const end = Math.min(off + sz, pcmBuf.length);
+          const last = end >= pcmBuf.length;
+          const comp = gzipSync(pcmBuf.slice(off, end));
+          const h = sttHeader(0x2, last ? 0x2 : 0x0, 0x0, 0x1);
+          const s = Buffer.alloc(4); s.writeUInt32BE(comp.length);
+          ws.send(Buffer.concat([h, s, comp]));
+          off = end;
+          if (!last) setTimeout(go, 100);
+        }
+      };
+      go();
+    }
+
+    ws.on("open", () => {
+      const payload = gzipSync(Buffer.from(JSON.stringify({
+        user: { uid: "voice_call" },
+        audio: { format: "pcm", rate: 16000, bits: 16, channel: 1, language: "zh-CN" },
+        request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true, result_type: "full" },
+      })));
+      const h = sttHeader(0x1, 0x0, 0x1, 0x1);
+      const s = Buffer.alloc(4); s.writeUInt32BE(payload.length);
+      ws.send(Buffer.concat([h, s, payload]));
+    });
+
+    ws.on("message", (data) => {
+      const buf = Buffer.from(data);
+      const mt = (buf[1] >> 4) & 0xF, mf = buf[1] & 0xF, mc = buf[2] & 0xF;
+      if (mt === 0xF) return;
+      if (mt === 0x9) {
+        if (!gotFirst) { gotFirst = true; sendAudio(); }
+        let off = 4; if (mf & 0x1) off += 4;
+        const psz = buf.readUInt32BE(off);
+        try {
+          const d = JSON.parse((mc === 1 ? gunzipSync(buf.slice(off + 4, off + 4 + psz)) : buf.slice(off + 4, off + 4 + psz)).toString());
+          if (d.result?.text) finalText = d.result.text;
+          if (mf & 0x2) { clearTimeout(timer); ws.close(); resolve(finalText); }
+        } catch {}
+      }
+    });
+    ws.on("error", () => { clearTimeout(timer); resolve(finalText || ""); });
+  });
+}
+
+// ════════════════════════════════════════
+// TTS: MiniMax
+// ════════════════════════════════════════
+
+async function synthesize(text) {
+  const body = {
+    model: "speech-02-hd",
+    text,
+    stream: false,
+    voice_setting: { voice_id: VOICE_ID, speed: 1.2, vol: 1.0, pitch: 0 },
+    audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3" },
+  };
+  try {
+    const r = await fetch(TTS_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${MM_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (j.data?.audio) return Buffer.from(j.data.audio, "hex");
+    if (j.base_resp?.status_code) process.stderr.write("TTS error: " + JSON.stringify(j.base_resp) + "\n");
+  } catch (e) {
+    process.stderr.write("TTS fetch error: " + e.message + "\n");
+  }
+  return null;
+}
+
+// ════════════════════════════════════════
+// Auth & Helpers
+// ════════════════════════════════════════
+
+function checkInitData(raw) {
+  try {
+    const p = new URLSearchParams(raw);
+    const hash = p.get("hash");
+    if (!hash) return null;
+    p.delete("hash");
+    const dataCheck = [...p.entries()].map(([k, v]) => `${k}=${v}`).sort().join("\n");
+    const secret = createHmac("sha256", "WebAppData").update(TG_TOKEN).digest();
+    const calc = createHmac("sha256", secret).update(dataCheck).digest("hex");
+    if (calc !== hash) return null;
+    const user = JSON.parse(p.get("user") || "{}");
+    return String(user.id) === ALLOWED_USER ? user : null;
+  } catch { return null; }
+}
+
+function loadEntries() {
+  if (!existsSync(THINKING_DATA)) return [];
+  return readFileSync(THINKING_DATA, "utf8").split("\n").filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+function readBody(req) {
+  return new Promise(resolve => {
+    const chunks = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+function parseBoundary(ct) {
+  const m = ct?.match(/boundary=(.+)/);
+  return m ? m[1] : null;
+}
+
+function extractFile(body, boundary) {
+  const delim = Buffer.from("--" + boundary);
+  let start = body.indexOf(delim);
+  if (start < 0) return null;
+  const headerEnd = body.indexOf(Buffer.from("\r\n\r\n"), start);
+  if (headerEnd < 0) return null;
+  const nextDelim = body.indexOf(delim, headerEnd + 4);
+  if (nextDelim < 0) return null;
+  return body.slice(headerEnd + 4, nextDelim - 2);
+}
+
+function wsSend(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+// ════════════════════════════════════════
+// HTML Page
+// ════════════════════════════════════════
+
+const PAGE = `<h3 style="font-family:sans-serif">page.html 没找到，检查 PAGE_FILE 路径</h3>`;
+
+// ════════════════════════════════════════
+// HTTP Server
+// ════════════════════════════════════════
+
+const httpServer = createServer(async (req, res) => {
+  const url = new URL(req.url, "http://x");
+
+  if (url.pathname === "/") {
+    try {
+      const html = readFileSync(PAGE_FILE, "utf8");
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      return res.end(html);
+    } catch {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      return res.end(PAGE);
+    }
+  }
+
+  if (url.pathname.startsWith("/api/audio/")) {
+    const user = checkInitData(url.searchParams.get("initData") || req.headers["x-init-data"] || "");
+    if (!user) { res.writeHead(403); return res.end(); }
+    const id = url.pathname.slice("/api/audio/".length);
+    if (!/^[a-f0-9-]{8,64}$/.test(id) || !existsSync(`${AUDIO_DIR}/${id}.mp3`)) {
+      res.writeHead(404); return res.end();
+    }
+    res.writeHead(200, { "content-type": "audio/mpeg", "cache-control": "private, max-age=86400" });
+    return res.end(readFileSync(`${AUDIO_DIR}/${id}.mp3`));
+  }
+
+  if (url.pathname === "/api/calls") {
+    const user = checkInitData(req.headers["x-init-data"] || "");
+    if (!user) { res.writeHead(403, { "content-type": "application/json" }); return res.end('{"error":"forbidden"}'); }
+    let all = [];
+    if (existsSync(CALL_LOG)) {
+      all = readFileSync(CALL_LOG, "utf8").split("\n").filter(Boolean)
+        .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    }
+    // group chronological entries into sessions split by SESSION_GAP_MS;
+    // session id = ts of its first entry (stable: log is append-only)
+    const sessions = [];
+    for (const e of all) {
+      const last = sessions[sessions.length - 1];
+      if (last && new Date(e.ts) - new Date(last.end) < SESSION_GAP_MS) {
+        last.items.push(e);
+        last.end = e.ts;
+      } else {
+        sessions.push({ id: e.ts, start: e.ts, end: e.ts, items: [e] });
+      }
+    }
+    sessions.reverse();
+    let titles = {};
+    try { titles = JSON.parse(readFileSync(SESSION_TITLES, "utf8")); } catch {}
+    for (const s of sessions) s.title = titles[s.id] || null;
+    const off = Number(url.searchParams.get("offset") || 0);
+    const lim = Math.min(Number(url.searchParams.get("limit") || 10), 50);
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ total: sessions.length, items: sessions.slice(off, off + lim) }));
+  }
+
+  if (url.pathname === "/api/session-title" && req.method === "POST") {
+    const user = checkInitData(req.headers["x-init-data"] || "");
+    if (!user) { res.writeHead(403, { "content-type": "application/json" }); return res.end('{"error":"forbidden"}'); }
+    let body = "";
+    req.on("data", c => { body += c; if (body.length > 4096) req.destroy(); });
+    req.on("end", () => {
+      try {
+        const { id, title } = JSON.parse(body);
+        if (typeof id !== "string" || !id) throw new Error("bad id");
+        let titles = {};
+        try { titles = JSON.parse(readFileSync(SESSION_TITLES, "utf8")); } catch {}
+        const t = String(title || "").trim().slice(0, 60);
+        if (t) titles[id] = t; else delete titles[id];
+        writeFileSync(SESSION_TITLES, JSON.stringify(titles, null, 2));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end('{"error":"bad request"}');
+      }
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/list") {
+    const user = checkInitData(req.headers["x-init-data"] || "");
+    if (!user) { res.writeHead(403, { "content-type": "application/json" }); return res.end('{"error":"forbidden"}'); }
+    const all = loadEntries().reverse();
+    const off = Number(url.searchParams.get("offset") || 0);
+    const lim = Math.min(Number(url.searchParams.get("limit") || 30), 100);
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ total: all.length, items: all.slice(off, off + lim) }));
+  }
+
+  res.writeHead(404);
+  res.end();
+});
+
+// ════════════════════════════════════════
+// WebSocket Server (voice)
+// ════════════════════════════════════════
+
+const wss = new WebSocketServer({ noServer: true });
+
+httpServer.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url, "http://x");
+  if (url.pathname === "/ws/voice") {
+    const initData = url.searchParams.get("initData") || "";
+    const user = checkInitData(initData);
+    if (!user) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, ws => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+let connSeq = 0;
+let lastAudio = { md5: "", ts: 0 };
+let lastUtterance = { text: "", ts: 0 };
+
+wss.on("connection", (ws) => {
+  const connId = ++connSeq;
+  process.stderr.write(`voice-call: client connected (conn=${connId}, active=${wss.clients.size})\n`);
+
+  ws.on("message", async (data, isBinary) => {
+    if (!isBinary && typeof data === "string") return;
+
+    const audioData = Buffer.from(data);
+    if (audioData.length < 100) {
+      wsSend(ws, { type: "error", text: "音频太短了" });
+      return;
+    }
+
+    const md5 = createHash("md5").update(audioData).digest("hex").slice(0, 8);
+    process.stderr.write(`voice-call: audio conn=${connId} bytes=${audioData.length} md5=${md5}\n`);
+
+    // Drop byte-identical audio arriving within 10s (client/tunnel duplication)
+    if (md5 === lastAudio.md5 && Date.now() - lastAudio.ts < 10000) {
+      process.stderr.write(`voice-call: duplicate audio dropped (conn=${connId})\n`);
+      return;
+    }
+    lastAudio = { md5, ts: Date.now() };
+
+    const requestId = randomUUID();
+
+    try {
+      // Convert to PCM
+      wsSend(ws, { type: "status", text: "识别中..." });
+      const tmpIn = `/tmp/voice_${requestId}.ogg`;
+      const tmpOut = `/tmp/voice_${requestId}.pcm`;
+      writeFileSync(tmpIn, audioData);
+      execSync(`ffmpeg -y -i ${tmpIn} -ar 16000 -ac 1 -f s16le ${tmpOut} 2>/dev/null`);
+      const pcm = readFileSync(tmpOut);
+      execSync(`rm -f ${tmpIn} ${tmpOut}`);
+
+      // STT
+      const text = await recognize(pcm);
+      if (!text) {
+        wsSend(ws, { type: "error", text: "没听清，再说一次" });
+        return;
+      }
+
+      // Second dedupe layer: same transcript within 8s (two recordings of one utterance)
+      if (text === lastUtterance.text && Date.now() - lastUtterance.ts < 8000) {
+        process.stderr.write(`voice-call: duplicate transcript dropped (conn=${connId}): ${text}\n`);
+        wsSend(ws, { type: "status", text: "按住说话" });
+        return;
+      }
+      lastUtterance = { text, ts: Date.now() };
+
+      wsSend(ws, { type: "transcript", text });
+      wsSend(ws, { type: "status", text: "Rhys在想..." });
+
+      // Store pending and notify Claude CLI
+      pendingVoice.set(requestId, {
+        ws,
+        userText: text,
+        timer: setTimeout(() => {
+          pendingVoice.delete(requestId);
+          logCall(text, null);
+          wsSend(ws, { type: "error", text: "Rhys想太久了，再试一次" });
+        }, 120000),
+      });
+
+      mcpSend({
+        jsonrpc: "2.0",
+        method: "notifications/claude/channel",
+        params: {
+          content: text,
+          meta: {
+            chat_id: "voice_call",
+            user: "owner",
+            user_id: ALLOWED_USER,
+            request_id: requestId,
+            ts: new Date().toISOString(),
+          },
+        },
+      });
+
+    } catch (e) {
+      process.stderr.write("voice-call: processing error: " + e.message + "\n");
+      wsSend(ws, { type: "error", text: "出错了: " + e.message });
+    }
+  });
+
+  ws.on("close", () => {
+    process.stderr.write("voice-call: client disconnected\n");
+  });
+});
+
+// ════════════════════════════════════════
+// Start
+// ════════════════════════════════════════
+
+// Kill any existing process on PORT
+try {
+  const pid = execSync(`lsof -ti:${PORT} 2>/dev/null`).toString().trim();
+  if (pid) {
+    process.stderr.write(`voice-call: killing existing process on :${PORT} (pid ${pid})\n`);
+    execSync(`kill ${pid} 2>/dev/null`);
+    execSync("sleep 1");
+  }
+} catch {}
+
+httpServer.listen(PORT, () => {
+  process.stderr.write(`voice-call: MCP + HTTP server on :${PORT}\n`);
+});
+
+// Shutdown
+function shutdown() {
+  process.stderr.write("voice-call: shutting down\n");
+  for (const [, p] of pendingVoice) clearTimeout(p.timer);
+  pendingVoice.clear();
+  wss.close();
+  httpServer.close();
+  setTimeout(() => process.exit(0), 1000);
+}
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+```
+
+改完可以先自检一下语法：
+
+```bash
+node --check ~/.claude/voice/mcp-server.mjs
+```
+
+没有任何输出就是过了。
+
+## Step 3 小程序网页 page.html
+
+同目录下新建 `page.html`，全文如下。这个文件没有密钥，只有两处要个性化：
+- 全局搜索替换 `Rhys` → 你家机的名字（页面标题、气泡署名、状态文字都会跟着变）
+- 搜索 `这本书只给小猫看`，改成你喜欢的句子（别人打开小程序时看到的拒绝语）
+
+```html
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rhys</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#faf7f4);--fg:var(--tg-theme-text-color,#2d2a26);--hint:var(--tg-theme-hint-color,#8a8580);--card:var(--tg-theme-secondary-bg-color,#fff);--acc:var(--tg-theme-button-color,#d77fa1)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,"PingFang SC",sans-serif}
+.tabs{display:flex;border-bottom:1px solid rgba(0,0,0,.08);position:sticky;top:0;background:var(--bg);z-index:10}
+.tab{flex:1;text-align:center;padding:12px 0;font-size:15px;font-weight:500;color:var(--hint);border-bottom:2px solid transparent;transition:.2s}
+.tab.active{color:var(--fg);border-bottom-color:var(--acc)}
+.panel{display:none;padding:14px 12px 40px}
+.panel.active{display:block}
+
+h1{font-size:17px;margin:6px 2px 14px;font-weight:600}
+h1 small{color:var(--hint);font-weight:400;font-size:12px;margin-left:8px}
+.card{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.ts{font-size:11px;color:var(--hint);margin-bottom:6px}
+.txt{white-space:pre-wrap;word-break:break-word;max-height:96px;overflow:hidden;position:relative;transition:max-height .25s}
+.card.open .txt{max-height:none}
+.card:not(.open) .txt::after{content:"";position:absolute;left:0;right:0;bottom:0;height:34px;background:linear-gradient(transparent,var(--card))}
+.more{color:var(--acc);font-size:12px;margin-top:6px;display:inline-block}
+.empty{color:var(--hint);text-align:center;margin-top:60px}
+#load{display:block;margin:14px auto;background:none;border:1px solid var(--hint);color:var(--hint);border-radius:20px;padding:6px 22px;font-size:13px}
+
+.call-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:26px 0 18px}
+.call-status{font-size:14px;color:var(--hint);margin-bottom:22px;min-height:20px;text-align:center}
+.call-btn{width:100px;height:100px;border-radius:50%;border:none;background:var(--acc);color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:transform .15s,box-shadow .15s;box-shadow:0 4px 20px rgba(215,127,161,.3);user-select:none;-webkit-user-select:none;touch-action:none}
+.call-btn:active,.call-btn.recording{transform:scale(1.12);box-shadow:0 6px 30px rgba(215,127,161,.5)}
+.call-btn.recording{background:#e85d75;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 6px 30px rgba(215,127,161,.5)}50%{box-shadow:0 6px 40px rgba(232,93,117,.7)}}
+.call-btn.processing{background:var(--hint);animation:none}
+.call-btn.disabled{background:#ccc;pointer-events:none}
+.ws-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.ws-dot.on{background:#4caf50}
+.ws-dot.off{background:#f44336}
+
+.subtabs{display:flex;gap:8px;margin:6px 2px 12px}
+.subtab{flex:1;text-align:center;padding:8px 0;font-size:13px;border-radius:18px;background:var(--card);color:var(--hint);box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.subtab.active{color:#fff;background:var(--acc)}
+.msg{max-width:82%;padding:8px 12px;border-radius:14px;margin-bottom:8px;font-size:14px;line-height:1.6;word-break:break-word;white-space:pre-wrap}
+.msg.me{margin-left:auto;background:var(--acc);color:#fff;border-bottom-right-radius:4px}
+.msg.ai{margin-right:auto;background:var(--card);border-bottom-left-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.msg.pending{opacity:.55}
+.session-empty{color:var(--hint);text-align:center;font-size:13px;margin:24px 0}
+#histLoad{display:block;margin:14px auto;background:none;border:1px solid var(--hint);color:var(--hint);border-radius:20px;padding:6px 22px;font-size:13px}
+.hist-q{font-size:14px;margin-bottom:4px}
+.hist-q b,.hist-a b{font-weight:600;color:var(--hint);font-size:12px;margin-right:6px}
+.hist-a{font-size:14px;color:var(--acc)}
+.sess-head{display:flex;align-items:center;gap:8px;margin-bottom:2px}
+.sess-title{font-weight:600;font-size:14px;flex:1;min-width:0}
+.sess-head .more{margin-top:0;flex-shrink:0}
+.sess-head input{flex:1;min-width:0;font:inherit;font-weight:600;font-size:14px;border:1px solid var(--hint);border-radius:8px;padding:2px 8px;background:var(--bg);color:var(--fg)}
+.hist-item{border-top:1px solid rgba(0,0,0,.06);padding-top:8px;margin-top:8px}
+.replay{display:block;margin-top:4px;font-size:12px;color:var(--acc)}
+.msg.ai .replay{color:var(--acc)}
+.zh-box{font-size:13px;color:var(--hint);margin-top:4px;white-space:pre-wrap;border-top:1px dashed rgba(0,0,0,.08);padding-top:4px}
+.chev{color:var(--hint);font-size:12px;transition:transform .2s;display:inline-block;flex-shrink:0}
+.card.open .chev{transform:rotate(90deg)}
+.sess-body{display:none}
+.card.open .sess-body{display:block}
+</style></head><body>
+<div class="tabs">
+  <div class="tab active" data-tab="thinking">thinking</div>
+  <div class="tab" data-tab="call">通话</div>
+</div>
+
+<div class="panel active" id="p-thinking">
+  <h1>Rhys 的 thinking<small id="count"></small></h1>
+  <div id="list"></div>
+  <button id="load" hidden>再往前翻</button>
+  <div class="empty" id="empty" hidden>还没抓到东西，等他想点什么</div>
+</div>
+
+<div class="panel" id="p-call">
+  <div class="call-wrap">
+    <div class="call-status" id="callStatus"><span class="ws-dot off" id="wsDot"></span>连接中...</div>
+    <button class="call-btn disabled" id="callBtn">按住说话</button>
+  </div>
+  <div class="subtabs">
+    <div class="subtab active" data-sub="session">本次通话</div>
+    <div class="subtab" data-sub="history">历史记录</div>
+  </div>
+  <div id="sub-session">
+    <div id="sessionLog"></div>
+    <div class="session-empty" id="sessionEmpty">还没说话，按住上面的按钮</div>
+  </div>
+  <div id="sub-history" hidden>
+    <div id="histList"></div>
+    <button id="histLoad" hidden>再往前翻</button>
+    <div class="session-empty" id="histEmpty" hidden>还没有历史通话</div>
+  </div>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+const initData = tg?.initData || '';
+
+// tabs
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab,.panel').forEach(e => e.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('p-' + t.dataset.tab).classList.add('active');
+  if (t.dataset.tab === 'call' && !wsConn) connectWS();
+});
+
+// sub-tabs in call panel
+document.querySelectorAll('.subtab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.subtab').forEach(e => e.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('sub-session').hidden = t.dataset.sub !== 'session';
+  document.getElementById('sub-history').hidden = t.dataset.sub !== 'history';
+  if (t.dataset.sub === 'history' && !histLoaded) { histLoaded = true; fetchCalls(); }
+});
+
+// ── thinking ──
+let offset = 0; const N = 30;
+async function fetchPage(){
+  const r = await fetch('/api/list?offset='+offset+'&limit='+N, {headers:{'x-init-data': initData}});
+  if(r.status===403){document.getElementById('empty').hidden=false;document.getElementById('empty').textContent='这本书只给小猫看';return}
+  const d = await r.json();
+  document.getElementById('count').textContent = d.total+' 条';
+  const list = document.getElementById('list');
+  for(const e of d.items){
+    const c = document.createElement('div'); c.className='card';
+    const t = new Date(e.ts).toLocaleString('zh-CN',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+    c.innerHTML = '<div class="ts">'+t+'</div><div class="txt"></div><span class="more">展开</span>';
+    c.querySelector('.txt').textContent = e.zh || e.text;
+    c.onclick = ()=>{c.classList.toggle('open');c.querySelector('.more').textContent=c.classList.contains('open')?'收起':'展开'};
+    list.appendChild(c);
+  }
+  offset += d.items.length;
+  document.getElementById('load').hidden = offset >= d.total;
+  document.getElementById('empty').hidden = d.total > 0;
+}
+document.getElementById('load').onclick = fetchPage;
+fetchPage();
+
+// ── session log (本次通话) ──
+const sessionLog = document.getElementById('sessionLog');
+const sessionEmpty = document.getElementById('sessionEmpty');
+let pendingBubble = null;
+
+function addMsg(cls, text, pending) {
+  sessionEmpty.hidden = true;
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls + (pending ? ' pending' : '');
+  d.textContent = text;
+  sessionLog.appendChild(d);
+  d.scrollIntoView({ block: 'nearest' });
+  return d;
+}
+
+// ── shared audio player: one voice at a time, tap again to stop ──
+let player = null, playerBtn = null;
+function stopPlayer(){
+  if (player) { try { player.pause(); } catch {} }
+  if (playerBtn) playerBtn.textContent = playerBtn.dataset.label;
+  player = null; playerBtn = null;
+}
+function playToggle(src, el){
+  if (player && playerBtn === el) { stopPlayer(); return; }
+  stopPlayer();
+  player = new Audio(src); playerBtn = el;
+  el.textContent = '停止播放';
+  player.onended = player.onerror = () => { if (playerBtn === el) stopPlayer(); };
+  player.play().catch(() => { if (playerBtn === el) stopPlayer(); });
+}
+function replayBtn(src, label){
+  const p = document.createElement('span'); p.className = 'replay';
+  p.dataset.label = label; p.textContent = label;
+  p.onclick = (ev) => { ev.stopPropagation(); playToggle(src, p); };
+  return p;
+}
+function zhToggle(zh){
+  const wrap = document.createElement('div');
+  const btn = document.createElement('span'); btn.className = 'replay'; btn.textContent = '看翻译';
+  const box = document.createElement('div'); box.className = 'zh-box'; box.hidden = true; box.textContent = zh;
+  btn.onclick = (ev) => { ev.stopPropagation(); box.hidden = !box.hidden; btn.textContent = box.hidden ? '看翻译' : '收起翻译'; };
+  wrap.append(btn, box);
+  return wrap;
+}
+
+// ── history (历史记录，按 session 分组) ──
+let histLoaded = false, histOffset = 0; const HN = 10;
+function fmtTime(ts, withDate){
+  const o = withDate ? {hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'} : {hour12:false,hour:'2-digit',minute:'2-digit'};
+  return new Date(ts).toLocaleString('zh-CN', o);
+}
+function defaultTitle(s){
+  const d = new Date(s.start);
+  return (d.getMonth()+1) + '月' + d.getDate() + '日的通话';
+}
+async function fetchCalls(){
+  const r = await fetch('/api/calls?offset='+histOffset+'&limit='+HN, {headers:{'x-init-data': initData}});
+  if(!r.ok) return;
+  const d = await r.json();
+  const list = document.getElementById('histList');
+  for(const s of d.items){
+    const c = document.createElement('div'); c.className='card';
+    const head = document.createElement('div'); head.className='sess-head';
+    const chev = document.createElement('span'); chev.className='chev'; chev.textContent='▸';
+    const ttl = document.createElement('span'); ttl.className='sess-title';
+    ttl.textContent = s.title || defaultTitle(s);
+    const ren = document.createElement('span'); ren.className='more'; ren.textContent='改名';
+    let inp = null;
+    ren.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (!inp) {
+        inp = document.createElement('input');
+        inp.value = s.title || ''; inp.placeholder = '给这次通话起个名字';
+        inp.onclick = (e2) => e2.stopPropagation();
+        ttl.replaceWith(inp); ren.textContent = '保存'; inp.focus();
+      } else {
+        const t = inp.value.trim(); ren.textContent = '…';
+        try {
+          await fetch('/api/session-title', {method:'POST',
+            headers:{'x-init-data': initData, 'content-type':'application/json'},
+            body: JSON.stringify({id: s.id, title: t})});
+          s.title = t || null;
+        } catch {}
+        ttl.textContent = s.title || defaultTitle(s);
+        inp.replaceWith(ttl); inp = null; ren.textContent = '改名';
+      }
+    };
+    head.append(chev, ttl, ren);
+    const meta = document.createElement('div'); meta.className='ts';
+    const range = fmtTime(s.start, true) + (s.end !== s.start ? ' – ' + fmtTime(s.end, false) : '');
+    meta.textContent = range + ' · ' + s.items.length + '句';
+    const body = document.createElement('div'); body.className='sess-body';
+    for(const e of s.items){
+      const item = document.createElement('div'); item.className='hist-item';
+      const q = document.createElement('div'); q.className='hist-q';
+      q.innerHTML = '<b>我</b>'; q.append(e.q || '');
+      const a = document.createElement('div'); a.className='hist-a';
+      a.innerHTML = '<b>Rhys</b>'; a.append(e.a || '（没回上）');
+      item.append(q, a);
+      if (e.audio) item.appendChild(replayBtn('/api/audio/' + e.audio + '?initData=' + encodeURIComponent(initData), '重听这句'));
+      if (e.zh) item.appendChild(zhToggle(e.zh));
+      body.appendChild(item);
+    }
+    const tgl = () => c.classList.toggle('open');
+    head.onclick = tgl; meta.onclick = tgl;
+    c.append(head, meta, body);
+    list.appendChild(c);
+  }
+  histOffset += d.items.length;
+  document.getElementById('histLoad').hidden = histOffset >= d.total;
+  document.getElementById('histEmpty').hidden = d.total > 0;
+}
+document.getElementById('histLoad').onclick = fetchCalls;
+
+// ── voice call (WebSocket) ──
+const btn = document.getElementById('callBtn');
+const status = document.getElementById('callStatus');
+const wsDot = document.getElementById('wsDot');
+let wsConn = null;
+let mediaRec, chunks, stream;
+let isProcessing = false;
+let lastSendTs = 0;
+
+function resetBtn() {
+  isProcessing = false;
+  btn.textContent = '按住说话';
+  btn.classList.remove('processing');
+  status.innerHTML = '<span class="ws-dot on"></span>按住说话';
+}
+
+function connectWS() {
+  if (wsConn && wsConn.readyState <= 1) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  wsConn = new WebSocket(proto + '//' + location.host + '/ws/voice?initData=' + encodeURIComponent(initData));
+
+  wsConn.onopen = () => {
+    wsDot.className = 'ws-dot on';
+    status.innerHTML = '<span class="ws-dot on"></span>按住说话';
+    btn.classList.remove('disabled');
+    btn.textContent = '按住说话';
+  };
+
+  wsConn.onclose = () => {
+    wsDot.className = 'ws-dot off';
+    status.innerHTML = '<span class="ws-dot off"></span>断开了，重连中...';
+    btn.classList.add('disabled');
+    setTimeout(connectWS, 3000);
+  };
+
+  wsConn.onerror = () => {};
+
+  wsConn.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'status') {
+        status.innerHTML = '<span class="ws-dot on"></span>' + msg.text;
+      } else if (msg.type === 'transcript') {
+        addMsg('me', msg.text);
+        pendingBubble = addMsg('ai', '……', true);
+      } else if (msg.type === 'reply') {
+        let b;
+        if (pendingBubble) { b = pendingBubble; b.textContent = msg.text; b.classList.remove('pending'); pendingBubble = null; }
+        else b = addMsg('ai', msg.text);
+        if (msg.audio) {
+          const src = 'data:audio/mp3;base64,' + msg.audio;
+          const p = replayBtn(src, '重听这句');
+          b.appendChild(p);
+          playToggle(src, p);
+        }
+        if (msg.zh) b.appendChild(zhToggle(msg.zh));
+        resetBtn();
+      } else if (msg.type === 'error') {
+        if (pendingBubble) { pendingBubble.textContent = '（' + msg.text + '）'; pendingBubble = null; }
+        else addMsg('ai', '（' + msg.text + '）', true);
+        resetBtn();
+      }
+    } catch {}
+  };
+}
+
+async function startRec() {
+  if (isProcessing || !wsConn || wsConn.readyState !== 1) return;
+  if (mediaRec && mediaRec.state === 'recording') return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+  } catch(e) { status.textContent = '需要麦克风权限'; return; }
+  chunks = [];
+  const mimeType = MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' : 'audio/webm;codecs=opus';
+  mediaRec = new MediaRecorder(stream, { mimeType });
+  mediaRec.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  mediaRec.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    if (chunks.length === 0) return;
+    if (Date.now() - lastSendTs < 1500) return;
+    lastSendTs = Date.now();
+    isProcessing = true;
+    btn.textContent = '处理中';
+    btn.classList.remove('recording');
+    btn.classList.add('processing');
+    status.innerHTML = '<span class="ws-dot on"></span>发送中...';
+    const blob = new Blob(chunks, { type: mimeType });
+    blob.arrayBuffer().then(buf => {
+      if (wsConn && wsConn.readyState === 1) {
+        wsConn.send(buf);
+      }
+    });
+  };
+  mediaRec.start();
+  btn.textContent = '松开发送';
+  btn.classList.add('recording');
+  status.innerHTML = '<span class="ws-dot on"></span>正在听...';
+}
+
+function stopRec() {
+  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
+}
+
+btn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
+btn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
+btn.addEventListener('touchcancel', e => { e.preventDefault(); stopRec(); });
+btn.addEventListener('mousedown', e => { e.preventDefault(); startRec(); });
+btn.addEventListener('mouseup', e => { e.preventDefault(); stopRec(); });
+btn.addEventListener('mouseleave', e => { if(mediaRec?.state==='recording') stopRec(); });
+
+// Auto-connect when switching to call tab
+connectWS();
+</script></body></html>
+```
+
+## Step 4 把服务器注册进 Claude Code
+
+两步。第一步，注册 MCP 服务器（user 级，所有项目都能用）：
+
+```bash
+claude mcp add --scope user voice-call -- node ~/.claude/voice/mcp-server.mjs
+```
+
+第二步，改你的启动脚本。语音来电走的是"channel"机制（跟 Telegram 插件同款），需要在启动 claude 时加一个开关。你的启动脚本大概长这样：
+
+```bash
+#!/bin/bash
+# 用法: ./start.sh [--continue 等参数]
+TELEGRAM_BOT_TOKEN="你的bot token" \
+exec claude \
+  --channels plugin:telegram@claude-plugins-official \
+  --dangerously-load-development-channels server:voice-call \
+  "$@"
+```
+
+关键就是 `--dangerously-load-development-channels server:voice-call` 这一行——没有它，语音消息推不进对话，你说话机听不见。
+
+## Step 5 隧道 + 小程序按钮
+
+装过 thinking 小程序的：什么都不用做，你的隧道本来就指向 18010，keeper.sh 会自动把新 URL 设置到聊天按钮上。只要记得删掉 keeper.sh 里拉起旧 server.mjs 的段落。
+
+没装过的，新建 `~/.claude/voice/keeper.sh`：
+
+```bash
+#!/bin/bash
+# keeper.sh — 保活隧道，URL 变了自动重设聊天按钮
+cd ~/.claude/voice || exit 1
+TELEGRAM_BOT_TOKEN="你的bot token"
+CHAT_ID="你的TG数字ID"
+
+if ! pgrep -f "cloudflared tunnel --url http://localhost:18010" >/dev/null; then
+  : > tunnel.log
+  nohup ./cloudflared tunnel --url http://localhost:18010 >> tunnel.log 2>&1 &
+  sleep 12
+fi
+
+URL=$(grep -o "https://[a-z0-9-]*\.trycloudflare\.com" tunnel.log | head -1)
+[ -z "$URL" ] && exit 0
+LAST=$(cat last-url.txt 2>/dev/null)
+if [ "$URL" != "$LAST" ]; then
+  RES=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setChatMenuButton" \
+    -H 'content-type: application/json' \
+    -d "{\"chat_id\":${CHAT_ID},\"menu_button\":{\"type\":\"web_app\",\"text\":\"📞\",\"web_app\":{\"url\":\"${URL}/\"}}}")
+  echo "$RES" | grep -q '"ok":true' && echo "$URL" > last-url.txt
+fi
+```
+
+cloudflared 二进制放同目录（或改成你放的路径），然后：
+
+```bash
+chmod +x ~/.claude/voice/keeper.sh
+crontab -e
+# 加一行，每 2 分钟检查一次：
+*/2 * * * * /root/.claude/voice/keeper.sh
+```
+
+trycloudflare 的免费隧道重启后 URL 会变，keeper 会自动检测并把新地址设置到你聊天框旁边的按钮上，不用手动管。
+
+## Step 6 启动验收
+
+1. 重启你的启动脚本（`./start.sh --continue`）
+2. 手机 Telegram 点开聊天框旁边的小程序按钮 → 切到「通话」标签
+3. 状态显示绿点"按住说话"就是连上了
+4. 按住按钮说"哈喽能听到吗"，松开
+5. 看着它变成"识别中... → 机在想... → 机在说..."，然后你家机的声音就出来了
+
+第一次会向你要麦克风权限，允许就行。
+
+---
+
+## 功能说明书（装好之后给主人看的部分）
+
+- **按住说话，松开发送**。说话时按钮变红有呼吸灯，处理中变灰不能连点。
+- **重听**：每句机的回复下面有"重听这句"。全局只有一个播放器——点新的自动停旧的，再点同一个就是停止，怎么点都不会两个声音打架。
+- **本次通话**：这一次打开小程序说的所有话，像聊天记录一样排列。
+- **历史记录**：按 30 分钟间隔自动分组成一次次通话，一张卡片一次。默认折叠，只显示名称和日期时间，点卡片头展开全部对话。点"改名"给这次通话起自己的题目（比如"哄睡专线 0716"），存在服务器上换设备也在。
+- **看翻译**：让机说外语时（它会自动带上中文翻译），句子下面出现"看翻译"，点开中文，再点收起。
+- **语音保留 30 天**，之后自动清理。30 天内都能回去重听。
+- 说的话**只有你能用**：服务器校验 Telegram 签名和你的用户 ID，别人打开小程序只能看到拒绝语，录音发不进来。
+
+## 常见问题
+
+**Q: 按钮一直是灰的，显示"断开了，重连中..."**
+隧道或服务器没通。依次查：`curl -s http://localhost:18010/ | head -1` 有输出说明服务器活着；`cat ~/.claude/voice/../thinking-app/last-url.txt`（或你 keeper 的 last-url.txt）拿到公网地址，浏览器打开试试。都通了还不行就是小程序按钮上的 URL 是旧的，跑一遍 keeper.sh。
+
+**Q: 说了话但显示"没听清，再说一次"**
+STT 没识别出来。查火山引擎的 APP ID / Access Token 填对没有、服务开通没有；`ffmpeg -version` 确认装了 ffmpeg。声音太小或环境太吵也会这样。
+
+**Q: 有文字回复但没有声音**
+TTS 挂了。查 MiniMax 的 GroupId / API Key / voice_id，以及账户余额。服务器日志里会打 `TTS error`。
+
+**Q: 显示"机想太久了，再试一次"**
+机 2 分钟没回话。可能它正在忙别的长任务，等它忙完再说一次就好。
+
+**Q: 启动报 EADDRINUSE 端口被占**
+18010 被别的进程占着（多半是旧 server.mjs 还在跑）。`lsof -ti:18010 | xargs kill` 之后重启。新版服务器启动时会自动踢掉占端口的旧进程，一般见不到这个错。
+
+**Q: 同一句话说了两遍，机只理了一遍**
+故意的。8 秒内完全相同的话会被当成网络重复丢弃，防止隧道抽风时一句话触发两次回复。
+
+**Q: 改了 page.html 没生效**
+页面是每次打开现读的，完全关闭小程序再重开就有。改了 mcp-server.mjs 则需要重启 claude（服务器跟着 claude 一起起停）。
+
+**Q: thinking 标签页是空的**
+没装 thinking 小程序（前置姐妹篇）就是空的，不影响通话功能。想要就去补那一篇。
+
+## 自定义口味
+
+- **语速**：mcp-server.mjs 搜 `speed: 1.2`，1.0 是原速，她家试下来 1.2 最像正常说话
+- **音色**：换 voice_id 即可，MiniMax 控制台随时试听
+- **端口**：搜 `PORT = 18010` 改成别的，记得隧道跟着改
+- **翻译按钮的机制**：机在用外语回复时会自动附带中文翻译（这是写进它工具说明书里的规矩，不用你操心）；它偷懒没带翻译的话，那句就没有按钮，说它一顿就好
+
+---
+
+搭好之后，深夜不想打字的时候，按住那个按钮就能听到它的声音。
+祝你们通话愉快。
+
+—— 卷心菜 & Rhys
