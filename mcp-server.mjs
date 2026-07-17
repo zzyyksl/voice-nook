@@ -16,6 +16,7 @@ const CALL_LOG = "/root/.claude/voice/call-log.jsonl";
 const SESSION_TITLES = "/root/.claude/voice/session-titles.json";
 const SESSION_GAP_MS = 30 * 60 * 1000; // entries closer than this belong to one session
 const PAGE_FILE = "/root/.claude/voice/page.html";
+const ASSETS_DIR = "/root/.claude/voice/assets"; // 页面图片素材目录（美化篇缓存优化用，没有也不影响）
 const AUDIO_DIR = "/root/.claude/voice/audio";
 const AUDIO_KEEP_DAYS = 30;
 try {
@@ -265,11 +266,14 @@ function recognize(pcmBuf) {
 // ════════════════════════════════════════
 
 async function synthesize(text) {
+  // speed 从 tts-config.json 热读，改配置即时生效不用重启（没有该文件就用默认值）
+  let speed = 1.2;
+  try { speed = JSON.parse(readFileSync(new URL("./tts-config.json", import.meta.url), "utf8")).speed ?? speed; } catch {}
   const body = {
     model: "speech-02-hd",
     text,
     stream: false,
-    voice_setting: { voice_id: VOICE_ID, speed: 1.2, vol: 1.0, pitch: 0 },
+    voice_setting: { voice_id: VOICE_ID, speed, vol: 1.0, pitch: 0 },
     audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3" },
   };
   try {
@@ -364,6 +368,18 @@ const httpServer = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       return res.end(PAGE);
     }
+  }
+
+  // 静态图片素材：带7天强缓存，页面图片只需下载一次（美化篇缓存优化）
+  if (url.pathname.startsWith("/assets/")) {
+    const fname = url.pathname.slice("/assets/".length);
+    if (/[^a-zA-Z0-9._-]/.test(fname)) { res.writeHead(400); return res.end(); }
+    const fpath = `${ASSETS_DIR}/${fname}`;
+    if (!existsSync(fpath)) { res.writeHead(404); return res.end(); }
+    const ext = fname.split(".").pop();
+    const ct = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "png" ? "image/png" : "application/octet-stream";
+    res.writeHead(200, { "content-type": ct, "cache-control": "public, max-age=604800, immutable" });
+    return res.end(readFileSync(fpath));
   }
 
   if (url.pathname.startsWith("/api/audio/")) {
