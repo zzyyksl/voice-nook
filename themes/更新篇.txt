@@ -6,8 +6,9 @@
 ## 这次更新了什么
 
 1. **录音键搬家**：按住说话的按钮从页面中间搬到屏幕底部通栏长条，历史记录再长也不用翻回去按。夜间是玻璃长条，日间是手绘藤蔓长条
-2. **页面秒开**：老版页面 700 多 KB（图片全内嵌），每次打开全量下载。现在图片拆成独立文件走浏览器缓存——页面本体 24KB，图片带 7 天强缓存，第二次打开连图片请求都不发，弱网也不怕
-3. **语速热调**（顺手的小功能）：TTS 语速从 `~/.claude/voice/tts-config.json` 热读，改配置即时生效不用重启。不建文件就用默认值，无感
+2. **页面秒开**：老版页面 700 多 KB（图片全内嵌），每次打开全量下载。现在图片拆成独立文件走浏览器缓存——页面本体 24KB，图片带 7 天缓存（过期后先显旧图后台换新），第二次打开连图片请求都不发，弱网也不怕
+3. **动态接口防缓存**：历史记录、thinking 列表这类 API 加了 `no-store`，保证每次打开拿到的都是最新数据，不会被 WebView 的旧响应截住
+4. **语速热调**（顺手的小功能）：TTS 语速从 `~/.claude/voice/tts-config.json` 热读，改配置即时生效不用重启。不建文件就用默认值，无感
 
 ## 给主人的话
 
@@ -63,9 +64,21 @@ const ASSETS_DIR = "/root/.claude/voice/assets"; // 页面图片素材目录
     if (!existsSync(fpath)) { res.writeHead(404); return res.end(); }
     const ext = fname.split(".").pop();
     const ct = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "png" ? "image/png" : "application/octet-stream";
-    res.writeHead(200, { "content-type": ct, "cache-control": "public, max-age=604800, immutable" });
+    res.writeHead(200, { "content-type": ct, "cache-control": "public, max-age=604800, stale-while-revalidate=2592000" });
     return res.end(readFileSync(fpath));
   }
+```
+
+**③ 动态 API 加防缓存头**：找到 `/api/calls` 和 `/api/list` 两段里的
+
+```js
+res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+```
+
+改成
+
+```js
+res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 ```
 
 改完跑 `node --check 你的mcp-server.mjs` 确认语法没错。
@@ -85,7 +98,7 @@ const ASSETS_DIR = "/root/.claude/voice/assets"; // 页面图片素材目录
 
 1. 重启 claude（mcp-server.mjs 跟着 claude 起停，不重启补丁不生效）
 2. 主人把小程序彻底关掉重开
-3. 验收：录音条在底部、日夜切换正常、图片都在；`curl -sI http://localhost:18010/assets/night-texture.jpg | grep -i cache` 能看到 `cache-control: public, max-age=604800, immutable`
+3. 验收：录音条在底部、日夜切换正常、图片都在；`curl -sI http://localhost:18010/assets/night-texture.jpg | grep -i cache` 能看到 `cache-control: public, max-age=604800, stale-while-revalidate=2592000`
 
 ## 常见问题
 
@@ -96,7 +109,7 @@ const ASSETS_DIR = "/root/.claude/voice/assets"; // 页面图片素材目录
 小程序缓存，彻底关闭再重开。还不行就检查 `PAGE_FILE` 指的路径和你 cp 的目标是不是同一个文件。
 
 **Q: 以后自己换图怎么办？**
-图片缓存 7 天不过期（immutable），换图记得连文件名一起换（比如 day-title-v2.png），页面里同步改引用，不然客户端看不到新图。
+想立刻看到新图，换图时连文件名一起换（比如 day-title-v2.png），页面里同步改引用。忘了改名也不会永远卡住——缓存头带 stale-while-revalidate，7 天后会先显旧图、后台自动换新。
 
 **Q: 我没装过美化篇，直接跟这篇走行吗？**
 行。theme-page.html 自带双主题全部功能，等于美化篇+更新篇一步到位，装完记得看美化篇的注意事项。

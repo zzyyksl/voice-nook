@@ -378,7 +378,7 @@ const httpServer = createServer(async (req, res) => {
     if (!existsSync(fpath)) { res.writeHead(404); return res.end(); }
     const ext = fname.split(".").pop();
     const ct = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "png" ? "image/png" : "application/octet-stream";
-    res.writeHead(200, { "content-type": ct, "cache-control": "public, max-age=604800, immutable" });
+    res.writeHead(200, { "content-type": ct, "cache-control": "public, max-age=604800, stale-while-revalidate=2592000" });
     return res.end(readFileSync(fpath));
   }
 
@@ -419,7 +419,7 @@ const httpServer = createServer(async (req, res) => {
     for (const s of sessions) s.title = titles[s.id] || null;
     const off = Number(url.searchParams.get("offset") || 0);
     const lim = Math.min(Number(url.searchParams.get("limit") || 10), 50);
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     return res.end(JSON.stringify({ total: sessions.length, items: sessions.slice(off, off + lim) }));
   }
 
@@ -453,7 +453,7 @@ const httpServer = createServer(async (req, res) => {
     const all = loadEntries().reverse();
     const off = Number(url.searchParams.get("offset") || 0);
     const lim = Math.min(Number(url.searchParams.get("limit") || 30), 100);
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     return res.end(JSON.stringify({ total: all.length, items: all.slice(off, off + lim) }));
   }
 
