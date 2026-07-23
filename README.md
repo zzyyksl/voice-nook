@@ -70,6 +70,7 @@ claude mcp add --scope user voice-call -- node ~/.claude/voice/mcp-server.mjs
 ## 安全说明
 
 - `ALLOWED_USER` 白名单 + Telegram initData HMAC 校验，双保险
+- 默认配置下，服务仅监听 `127.0.0.1`，对外访问依赖 cloudflared 隧道；只有显式将 `VOICE_NOOK_HOST` 设置为 `0.0.0.0` 时才允许监听所有网卡，此时必须另行配置防火墙或安全组，禁止将 18010 端口无保护地暴露到公网。
 - 所有密钥写在你自己服务器的文件里，不经过任何第三方
 - 语音文件本地保存 30 天后自动清理
 
