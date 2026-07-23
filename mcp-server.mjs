@@ -8,9 +8,34 @@ import { readFileSync, existsSync, writeFileSync, appendFileSync, mkdirSync } fr
 import { execSync } from "node:child_process";
 import WebSocket, { WebSocketServer } from "ws";
 import { gzipSync, gunzipSync } from "node:zlib";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const PORT = 18010;
-const ALLOWED_USER = "你的TG数字ID"; // ① 手机TG搜 @userinfobot 发条消息就能拿到
+// 零依赖读取同目录 .env，不管这个脚本被谁（claude mcp / systemd / 手动）以什么方式启动都生效。
+// 已经存在的环境变量优先（不覆盖），方便临时用 shell 变量覆盖测试。
+try {
+  const envPath = join(dirname(fileURLToPath(import.meta.url)), ".env");
+  const raw = readFileSync(envPath, "utf8");
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+} catch {}
+
+const PORT = process.env.VOICE_NOOK_PORT || 18010;
+const HOST = process.env.VOICE_NOOK_HOST || "127.0.0.1";
+const ALLOWED_USER = process.env.VOICE_NOOK_ALLOWED_USER; // ① 手机TG搜 @userinfobot 发条消息就能拿到
 const THINKING_DATA = "/root/thinking-app/data/entries.jsonl"; // 装过thinking篇的路径对上，没装的不用管
 const CALL_LOG = "/root/.claude/voice/call-log.jsonl";
 const SESSION_TITLES = "/root/.claude/voice/session-titles.json";
@@ -25,17 +50,20 @@ try {
 } catch {}
 
 // ② Telegram bot token（@BotFather 给的那串，别泄露给任何人）
-const TG_TOKEN = "你的bot token";
+const TG_TOKEN = process.env.VOICE_NOOK_TG_TOKEN;
 
 // ──── MiniMax TTS ────
-const MM_GROUP = "你的GroupId"; // ③ MiniMax 账户管理里的 GroupId
-const MM_KEY = "你的MiniMax_API_Key"; // ④ 接口密钥里创建
-const TTS_URL = `https://api.minimax.chat/v1/t2a_v2?GroupId=${MM_GROUP}`;
-const VOICE_ID = "你的voice_id"; // ⑤ 系统音色或克隆音色的 ID
+const MM_GROUP = process.env.VOICE_NOOK_MM_GROUP; // ③ MiniMax 账户管理里的 GroupId
+const MM_KEY = process.env.VOICE_NOOK_MM_KEY; // ④ 接口密钥里创建
+// MiniMax 有区域隔离：国际 api.minimax.io，国内 api.minimaxi.com——key 和域名对不上会 401。
+// 默认用国内域名，因为这是Ada账户（stackchan项目里已验证过）实际能用的那个。
+const MM_BASE_URL = process.env.VOICE_NOOK_MM_BASE_URL || "https://api.minimaxi.com";
+const TTS_URL = `${MM_BASE_URL}/v1/t2a_v2?GroupId=${MM_GROUP}`;
+const VOICE_ID = process.env.VOICE_NOOK_VOICE_ID; // ⑤ 系统音色或克隆音色的 ID
 
 // ──── Volcengine STT ────
-const VOLC_APP_ID = "你的火山APP_ID"; // ⑥ 火山引擎控制台建应用拿到
-const VOLC_ACCESS_KEY = "你的火山Access_Token"; // ⑦ 同上应用里的 Access Token
+const VOLC_APP_ID = process.env.VOICE_NOOK_VOLC_APP_ID; // ⑥ 火山引擎控制台建应用拿到
+const VOLC_ACCESS_KEY = process.env.VOICE_NOOK_VOLC_ACCESS_KEY; // ⑦ 同上应用里的 Access Token
 const VOLC_RESOURCE = "volc.bigasr.sauc.duration";
 const VOLC_WS = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel";
 
@@ -593,8 +621,8 @@ try {
   }
 } catch {}
 
-httpServer.listen(PORT, () => {
-  process.stderr.write(`voice-call: MCP + HTTP server on :${PORT}\n`);
+httpServer.listen(PORT, HOST, () => {
+  process.stderr.write(`voice-call: MCP + HTTP server on ${HOST}:${PORT}\n`);
 });
 
 // Shutdown
